@@ -1,55 +1,14 @@
 import argparse
-import os
-import sys
-import json
-import logging
-from datetime import datetime
-import myvariant
+import pandas as pd
 from alphagenome.data import genome
 from alphagenome.models import dna_client
+from alphagenome import colab_utils
+from alphagenome.data import gene_annotation
+from alphagenome.data import transcript as transcript_utils
 from alphagenome.models import variant_scorers
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# 从环境变量读取 API Key
-API_KEY = os.environ.get("ALPHAGENOME_API_KEY")
-if not API_KEY:
-    logger.error("未设置环境变量 ALPHAGENOME_API_KEY，请设置后再运行")
-    sys.exit(1)
-
-
-def rsid_to_variant_info(rsid, genome_build="hg19"):
-    """输入 rsID，返回 variant 所需信息 (chrom, pos, ref, alt)"""
-    mv = myvariant.MyVariantInfo()
-    try:
-        out = mv.getvariant(rsid, fields="dbsnp")
-    except Exception as e:
-        raise RuntimeError(f"查询 {rsid} 失败: {e}")
-
-    if not out or "dbsnp" not in out:
-        raise ValueError(f"{rsid} 未找到相关 dbSNP 信息")
-
-    dbsnp = out["dbsnp"]
-    vartype = dbsnp.get("vartype", "").lower()
-    if vartype != "snv":
-        raise ValueError(f"{rsid} 不是单核苷酸变异 (SNV)，实际类型: {vartype}")
-
-    ref_base = dbsnp.get("ref")
-    alt_base = dbsnp.get("alt")
-    chrom = dbsnp.get("chrom")
-    pos = dbsnp.get(genome_build, {}).get("start")
-
-    if None in [ref_base, alt_base, chrom, pos]:
-        missing = []
-        if ref_base is None: missing.append("ref")
-        if alt_base is None: missing.append("alt")
-        if chrom is None: missing.append("chrom")
-        if pos is None: missing.append(f"pos({genome_build})")
-        raise ValueError(f"{rsid} 坐标或碱基信息不完整，缺失: {', '.join(missing)}")
-
-    return f"chr{chrom}", pos, ref_base, alt_base
+# 固定 API Key（保持不变）
+API_KEY = "AIzaSyD5Kht8QzCPkHeJ456_Tf_eBWirtKhmaRU"
 
 
 def parse_variant_line(line):
@@ -74,7 +33,6 @@ def parse_variant_line(line):
         raise ValueError(f"左边格式错误，缺少 ':' : {left}")
     chrom_part, pos_str = left.split(':', 1)
     chrom = chrom_part.strip()
-    # 如果染色体没有"chr"前缀，自动添加（保持与Variant构造函数一致）
     if not chrom.startswith('chr'):
         chrom = f"chr{chrom}"
     try:
@@ -82,126 +40,26 @@ def parse_variant_line(line):
     except ValueError:
         raise ValueError(f"位置解析错误: {pos_str}")
 
-    # 解析右边：ref > alt（可能有空格）
+    # 解析右边：ref > alt
     if ' > ' not in right:
         raise ValueError(f"右边格式错误，缺少 ' > ' : {right}")
     ref, alt = right.split(' > ', 1)
     ref = ref.strip()
     alt = alt.strip()
 
-    # 生成名称（用于输出文件名）
+    # 生成名称（用于显示）
     name = f"{chrom}:{pos}_{ref}>{alt}"
     return chrom, pos, ref, alt, name
 
 
-def score_variant_from_coords(chrom, pos, ref, alt, name, dna_model):
-    """
-    直接使用坐标进行打分，返回结果字典
-    """
-    variant = genome.Variant(
-        chromosome=chrom,
-        position=pos,
-        reference_bases=ref,
-        alternate_bases=alt,
-        name=name
-    )
+def main(input_file, outdir="."):
+    # 初始化模型
+    print('API reached...')
+    dna_model = dna_client.create(API_KEY)
 
-    # 定义预测区间（长度2048）
-    sequence_length = 2048
-    interval = variant.reference_interval.resize(sequence_length)
-
-    # 定义 scorer
-    scorer = variant_scorers.CenterMaskScorer(
-        width=None,
-        aggregation_type=variant_scorers.AggregationType.DIFF_SUM_LOG2,
-        requested_output=dna_client.OutputType.RNA_SEQ,
-    )
-
-    # 打分
-    try:
-        score_result = dna_model.score_variant(
-            interval=interval,
-            variant=variant,
-            variant_scorers=[scorer],
-            organism=dna_client.Organism.HOMO_SAPIENS,
-        )
-    except Exception as e:
-        raise RuntimeError(f"模型打分失败: {e}")
-
-    # 提取结果（假设 score_result[0].var 是得分）
-    result = {
-        "name": name,
-        "chromosome": chrom,
-        "position": pos,
-        "ref": ref,
-        "alt": alt,
-        "score_var": score_result[0].var if hasattr(score_result[0], 'var') else None,
-        "score_raw": str(score_result[0]) if not hasattr(score_result[0], 'var') else None,
-        "timestamp": datetime.now().isoformat()
-    }
-    return result
-
-
-def score_variant_by_rsid(rsid, dna_model):
-    """通过 rsID 进行打分"""
-    try:
-        chrom, pos, ref, alt = rsid_to_variant_info(rsid)
-        name = rsid
-    except Exception as e:
-        logger.error(f"转换 rsID 失败 ({rsid}): {e}")
-        return None
-
-    try:
-        result = score_variant_from_coords(chrom, pos, ref, alt, name, dna_model)
-        result["rsid"] = rsid  # 额外保存rsID
-        return result
-    except Exception as e:
-        logger.error(f"打分失败 ({rsid}): {e}")
-        return None
-
-
-def process_variants(variants, dna_model, outdir):
-    """
-    通用处理函数：对每个变异进行打分并保存
-    variants: 列表，每个元素是 (chrom, pos, ref, alt, name) 或 (name, chrom, pos, ref, alt) 的元组
-    """
-    os.makedirs(outdir, exist_ok=True)
-    all_results = []
-
-    for item in variants:
-        if len(item) == 5:
-            chrom, pos, ref, alt, name = item
-        else:
-            continue
-
-        logger.info(f"处理变异 {name} ...")
-        try:
-            result = score_variant_from_coords(chrom, pos, ref, alt, name, dna_model)
-            all_results.append(result)
-
-            # 每个变异单独保存 JSON 文件
-            out_file = os.path.join(outdir, f"{name}.json")
-            with open(out_file, "w") as f:
-                json.dump(result, f, indent=2)
-            logger.info(f"已保存结果至 {out_file}")
-        except Exception as e:
-            logger.error(f"处理变异 {name} 失败: {e}")
-
-    # 汇总保存所有结果
-    if all_results:
-        summary_file = os.path.join(outdir, "all_results.json")
-        with open(summary_file, "w") as f:
-            json.dump(all_results, f, indent=2)
-        logger.info(f"汇总结果保存至 {summary_file}")
-    else:
-        logger.warning("没有成功处理任何变异")
-
-
-def main_from_file(file_path, outdir):
-    """从文件读取变异列表并处理"""
-    logger.info(f"读取变异文件: {file_path}")
+    # 读取并解析输入文件
     variants = []
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(input_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             try:
                 parsed = parse_variant_line(line)
@@ -209,54 +67,86 @@ def main_from_file(file_path, outdir):
                     continue
                 variants.append(parsed)
             except Exception as e:
-                logger.warning(f"第 {line_num} 行解析失败: {line.strip()} - {e}")
+                print(f"警告：第 {line_num} 行解析失败: {line.strip()} - {e}")
 
     if not variants:
-        logger.error("未找到有效的变异行，退出")
+        print("错误：未找到有效的变异行，退出")
         return
 
-    logger.info(f"成功解析 {len(variants)} 个变异")
-    dna_model = dna_client.create(API_KEY)
-    process_variants(variants, dna_model, outdir)
+    print(f"成功解析 {len(variants)} 个变异，开始打分...")
 
+    # 存储所有结果
+    all_results = []
 
-def main_from_rsids(rsids, outdir):
-    """处理 rsID 列表"""
-    dna_model = dna_client.create(API_KEY)
-    variants = []
-    for rsid in rsids:
+    for chrom, pos, ref, alt, name in variants:
+        print(f"处理变异 {name} ...")
         try:
-            chrom, pos, ref, alt = rsid_to_variant_info(rsid)
-            variants.append((chrom, pos, ref, alt, rsid))
+            # 构建变异对象
+            variant = genome.Variant(
+                chromosome=chrom,
+                position=pos,
+                reference_bases=ref,
+                alternate_bases=alt,
+                name=name
+            )
+
+            # 定义预测区间
+            sequence_length = 2048
+            interval = variant.reference_interval.resize(sequence_length)
+
+            # 定义 scorer
+            scorer = variant_scorers.CenterMaskScorer(
+                width=None,
+                aggregation_type=variant_scorers.AggregationType.DIFF_SUM_LOG2,
+                requested_output=dna_client.OutputType.RNA_SEQ,
+            )
+
+            # 打分
+            score_result = dna_model.score_variant(
+                interval=interval,
+                variant=variant,
+                variant_scorers=[scorer],
+                organism=dna_client.Organism.HOMO_SAPIENS,
+            )
+
+            score_value = score_result[0].var if hasattr(score_result[0], 'var') else str(score_result[0])
+            all_results.append({
+                "name": name,
+                "chrom": chrom,
+                "pos": pos,
+                "ref": ref,
+                "alt": alt,
+                "score": score_value
+            })
+            print(f"  得分: {score_value}")
         except Exception as e:
-            logger.error(f"转换 rsID 失败 ({rsid}): {e}")
-    if variants:
-        process_variants(variants, dna_model, outdir)
-    else:
-        logger.error("没有有效的 rsID")
+            print(f"  错误: {e}")
+            all_results.append({
+                "name": name,
+                "chrom": chrom,
+                "pos": pos,
+                "ref": ref,
+                "alt": alt,
+                "score": f"ERROR: {e}"
+            })
+
+    # 将结果写入汇总 txt 文件
+    output_file = f"{outdir}/results.txt" if outdir != "." else "results.txt"
+    import os
+    os.makedirs(outdir, exist_ok=True)
+    with open(output_file, "w") as f:
+        f.write("name\tchromosome\tposition\tref\talt\tscore\n")
+        for r in all_results:
+            f.write(f"{r['name']}\t{r['chrom']}\t{r['pos']}\t{r['ref']}\t{r['alt']}\t{r['score']}\n")
+
+    print(f"[RESULT] 所有结果已保存到 {output_file}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="使用 AlphaGenome 对变异进行打分")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--rsid", action="append",
-                       help="dbSNP rsID，可多次使用或逗号分隔，如 --rsid rs123 --rsid rs456")
-    group.add_argument("--input", type=str,
-                       help="包含变异的文本文件，每行格式: chrX:40074676__G > A")
+    parser = argparse.ArgumentParser(description="从文本文件读取变异并打分（AlphaGenome）")
+    parser.add_argument("--input", type=str, required=True,
+                        help="包含变异的文本文件，每行格式: chrX:40074676__G > A")
     parser.add_argument("--outdir", default=".",
-                        help="输出目录（默认当前目录）")
+                        help="输出目录（默认当前目录），结果文件名为 results.txt")
     args = parser.parse_args()
-
-    if args.input:
-        main_from_file(args.input, args.outdir)
-    elif args.rsid:
-        # 处理 --rsid 参数：可能包含逗号分隔的多个
-        rsids = []
-        for item in args.rsid:
-            for part in item.split(','):
-                part = part.strip()
-                if part:
-                    rsids.append(part)
-        main_from_rsids(rsids, args.outdir)
-    else:
-        parser.error("请指定 --rsid 或 --input")
+    main(args.input, args.outdir)
