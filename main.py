@@ -91,7 +91,7 @@ def main(input_file, outdir="."):
             )
 
             # 定义预测区间
-            sequence_length = 2048
+            sequence_length = 16384
             interval = variant.reference_interval.resize(sequence_length)
 
             # 定义 scorer
