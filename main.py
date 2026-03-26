@@ -1,23 +1,17 @@
 import argparse
 import pandas as pd
 import numpy as np
+import os
 from alphagenome.data import genome
 from alphagenome.models import dna_client
-from alphagenome import colab_utils
-from alphagenome.data import gene_annotation
-from alphagenome.data import transcript as transcript_utils
 from alphagenome.models import variant_scorers
 
-# 固定 API Key（保持不变）
+# 固定 API Key
 API_KEY = "AIzaSyD5Kht8QzCPkHeJ456_Tf_eBWirtKhmaRU"
 
 
 def parse_variant_line(line):
-    """
-    解析一行变异文本，格式如:
-    chrX:40074676__G > A
-    返回 (chrom, pos, ref, alt, name)
-    """
+    """解析一行变异文本，格式如: chrX:40074676__G > A"""
     line = line.strip()
     if not line or line.startswith('#'):
         return None
@@ -49,37 +43,45 @@ def parse_variant_line(line):
     return chrom, pos, ref, alt, name
 
 
-def extract_scalar_score(score_result):
+def extract_scalar_score(score_result, variant_name, save_raw=False, outdir="."):
     """
-    从 score_variant 返回的结果中提取一个标量分数。
-    处理 DataFrame 类型，默认取所有轨道的 nonzero_mean 的平均值。
+    从 score_variant 返回的结果中提取标量分数。
+    如果 save_raw 为 True，则将原始的 var DataFrame 保存到文件。
     """
     if not score_result:
         raise ValueError("score_result 为空")
     res = score_result[0]
 
-    # 如果 .var 已经是数值
+    # 1) 如果是数值，直接返回
     if hasattr(res, 'var') and isinstance(res.var, (int, float, np.number)):
         return res.var
 
-    # 如果 .var 是 pandas DataFrame
+    # 2) 如果是 DataFrame
     if hasattr(res, 'var') and isinstance(res.var, pd.DataFrame):
         df = res.var
-        # 优先使用 nonzero_mean 列的平均值（该列在错误输出中可见）
+        # 可选：保存原始 DataFrame 以便检查
+        if save_raw:
+            raw_file = os.path.join(outdir, f"{variant_name}_raw.csv")
+            df.to_csv(raw_file, index=False)
+            print(f"    原始数据已保存至 {raw_file}")
+        
+        # 使用 nonzero_mean 列的平均值作为最终得分
         if 'nonzero_mean' in df.columns:
-            return df['nonzero_mean'].mean()
-        # 否则，对所有数值列取全局均值
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 0:
-            return df[numeric_cols].mean().mean()
-        # 最后兜底
-        raise TypeError("无法从 DataFrame 中提取数值")
-    
-    # 如果 .var 是 list/array 且长度为1，取第一个元素
+            score = df['nonzero_mean'].mean()
+            return score
+        else:
+            # 如果不存在 nonzero_mean，则取所有数值列的平均值
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                score = df[numeric_cols].mean().mean()
+                return score
+            else:
+                raise TypeError("DataFrame 中没有数值列")
+
+    # 3) 其他情况（如数组）
     if hasattr(res, 'var') and hasattr(res.var, '__len__') and len(res.var) == 1:
         return res.var[0]
-    
-    # 如果 .score 存在且为数值
+
     if hasattr(res, 'score') and isinstance(res.score, (int, float)):
         return res.score
 
@@ -107,10 +109,13 @@ def main(input_file, outdir="."):
 
     print(f"成功解析 {len(variants)} 个变异，开始打分...")
 
+    os.makedirs(outdir, exist_ok=True)
     all_results = []
 
     for chrom, pos, ref, alt, name in variants:
         print(f"处理变异 {name} ...")
+        print(f"  坐标: {chrom}:{pos}  {ref}>{alt}")
+
         try:
             variant = genome.Variant(
                 chromosome=chrom,
@@ -120,8 +125,10 @@ def main(input_file, outdir="."):
                 name=name
             )
 
+            # 确认区间
             sequence_length = 16384
             interval = variant.reference_interval.resize(sequence_length)
+            print(f"  区间: {interval.start} - {interval.end}")
 
             scorer = variant_scorers.CenterMaskScorer(
                 width=None,
@@ -136,7 +143,8 @@ def main(input_file, outdir="."):
                 organism=dna_client.Organism.HOMO_SAPIENS,
             )
 
-            score_value = extract_scalar_score(score_result)
+            # 提取标量分数，并可选保存原始 DataFrame
+            score_value = extract_scalar_score(score_result, name, save_raw=True, outdir=outdir)
             all_results.append({
                 "name": name,
                 "chrom": chrom,
@@ -157,9 +165,8 @@ def main(input_file, outdir="."):
                 "score": f"ERROR: {e}"
             })
 
-    output_file = f"{outdir}/results.txt" if outdir != "." else "results.txt"
-    import os
-    os.makedirs(outdir, exist_ok=True)
+    # 写入汇总结果
+    output_file = os.path.join(outdir, "results.txt")
     with open(output_file, "w") as f:
         f.write("name\tchromosome\tposition\tref\talt\tscore\n")
         for r in all_results:
