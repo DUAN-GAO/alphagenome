@@ -52,6 +52,29 @@ def parse_variant_line(line):
     return chrom, pos, ref, alt, name
 
 
+def extract_scalar_score(score_result):
+    """
+    从 score_variant 返回的结果中提取标量分数。
+    """
+    if not score_result:
+        raise ValueError("score_result 为空")
+    res = score_result[0]
+    # 优先使用 .var 属性（聚合后的标量）
+    if hasattr(res, 'var') and isinstance(res.var, (int, float)):
+        return res.var
+    # 如果 .var 不是数值，可能是数组或列表，尝试取第一个元素
+    if hasattr(res, 'var'):
+        if hasattr(res.var, '__len__') and len(res.var) == 1:
+            return res.var[0]
+        else:
+            raise TypeError(f"score.var 不是标量: {res.var}")
+    # 如果 .score 存在且为数值
+    if hasattr(res, 'score') and isinstance(res.score, (int, float)):
+        return res.score
+    # 最后的兜底：尝试将整个对象转为字符串，但这样可能不是标量，直接报错
+    raise RuntimeError(f"无法从结果中提取标量分数，结果类型: {type(res)}")
+
+
 def main(input_file, outdir="."):
     # 初始化模型
     print('API reached...')
@@ -94,7 +117,7 @@ def main(input_file, outdir="."):
             sequence_length = 16384
             interval = variant.reference_interval.resize(sequence_length)
 
-            # 定义 scorer
+            # 定义 scorer（指定聚合方式，确保输出标量）
             scorer = variant_scorers.CenterMaskScorer(
                 width=None,
                 aggregation_type=variant_scorers.AggregationType.DIFF_SUM_LOG2,
@@ -109,7 +132,8 @@ def main(input_file, outdir="."):
                 organism=dna_client.Organism.HOMO_SAPIENS,
             )
 
-            score_value = score_result[0].var if hasattr(score_result[0], 'var') else str(score_result[0])
+            # 提取标量分数
+            score_value = extract_scalar_score(score_result)
             all_results.append({
                 "name": name,
                 "chrom": chrom,
