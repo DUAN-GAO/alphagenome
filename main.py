@@ -1,5 +1,6 @@
 import argparse
 import pandas as pd
+import numpy as np
 from alphagenome.data import genome
 from alphagenome.models import dna_client
 from alphagenome import colab_utils
@@ -21,14 +22,12 @@ def parse_variant_line(line):
     if not line or line.startswith('#'):
         return None
 
-    # 按双下划线分割
     if '__' not in line:
         raise ValueError(f"行格式错误，缺少 '__' 分隔符: {line}")
     left, right = line.split('__', 1)
     left = left.strip()
     right = right.strip()
 
-    # 解析左边：chrom:pos
     if ':' not in left:
         raise ValueError(f"左边格式错误，缺少 ':' : {left}")
     chrom_part, pos_str = left.split(':', 1)
@@ -40,47 +39,57 @@ def parse_variant_line(line):
     except ValueError:
         raise ValueError(f"位置解析错误: {pos_str}")
 
-    # 解析右边：ref > alt
     if ' > ' not in right:
         raise ValueError(f"右边格式错误，缺少 ' > ' : {right}")
     ref, alt = right.split(' > ', 1)
     ref = ref.strip()
     alt = alt.strip()
 
-    # 生成名称（用于显示）
     name = f"{chrom}:{pos}_{ref}>{alt}"
     return chrom, pos, ref, alt, name
 
 
 def extract_scalar_score(score_result):
     """
-    从 score_variant 返回的结果中提取标量分数。
+    从 score_variant 返回的结果中提取一个标量分数。
+    处理 DataFrame 类型，默认取所有轨道的 nonzero_mean 的平均值。
     """
     if not score_result:
         raise ValueError("score_result 为空")
     res = score_result[0]
-    # 优先使用 .var 属性（聚合后的标量）
-    if hasattr(res, 'var') and isinstance(res.var, (int, float)):
+
+    # 如果 .var 已经是数值
+    if hasattr(res, 'var') and isinstance(res.var, (int, float, np.number)):
         return res.var
-    # 如果 .var 不是数值，可能是数组或列表，尝试取第一个元素
-    if hasattr(res, 'var'):
-        if hasattr(res.var, '__len__') and len(res.var) == 1:
-            return res.var[0]
-        else:
-            raise TypeError(f"score.var 不是标量: {res.var}")
+
+    # 如果 .var 是 pandas DataFrame
+    if hasattr(res, 'var') and isinstance(res.var, pd.DataFrame):
+        df = res.var
+        # 优先使用 nonzero_mean 列的平均值（该列在错误输出中可见）
+        if 'nonzero_mean' in df.columns:
+            return df['nonzero_mean'].mean()
+        # 否则，对所有数值列取全局均值
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            return df[numeric_cols].mean().mean()
+        # 最后兜底
+        raise TypeError("无法从 DataFrame 中提取数值")
+    
+    # 如果 .var 是 list/array 且长度为1，取第一个元素
+    if hasattr(res, 'var') and hasattr(res.var, '__len__') and len(res.var) == 1:
+        return res.var[0]
+    
     # 如果 .score 存在且为数值
     if hasattr(res, 'score') and isinstance(res.score, (int, float)):
         return res.score
-    # 最后的兜底：尝试将整个对象转为字符串，但这样可能不是标量，直接报错
+
     raise RuntimeError(f"无法从结果中提取标量分数，结果类型: {type(res)}")
 
 
 def main(input_file, outdir="."):
-    # 初始化模型
     print('API reached...')
     dna_model = dna_client.create(API_KEY)
 
-    # 读取并解析输入文件
     variants = []
     with open(input_file, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
@@ -98,13 +107,11 @@ def main(input_file, outdir="."):
 
     print(f"成功解析 {len(variants)} 个变异，开始打分...")
 
-    # 存储所有结果
     all_results = []
 
     for chrom, pos, ref, alt, name in variants:
         print(f"处理变异 {name} ...")
         try:
-            # 构建变异对象
             variant = genome.Variant(
                 chromosome=chrom,
                 position=pos,
@@ -113,18 +120,15 @@ def main(input_file, outdir="."):
                 name=name
             )
 
-            # 定义预测区间
             sequence_length = 16384
             interval = variant.reference_interval.resize(sequence_length)
 
-            # 定义 scorer（指定聚合方式，确保输出标量）
             scorer = variant_scorers.CenterMaskScorer(
                 width=None,
                 aggregation_type=variant_scorers.AggregationType.DIFF_SUM_LOG2,
                 requested_output=dna_client.OutputType.RNA_SEQ,
             )
 
-            # 打分
             score_result = dna_model.score_variant(
                 interval=interval,
                 variant=variant,
@@ -132,7 +136,6 @@ def main(input_file, outdir="."):
                 organism=dna_client.Organism.HOMO_SAPIENS,
             )
 
-            # 提取标量分数
             score_value = extract_scalar_score(score_result)
             all_results.append({
                 "name": name,
@@ -154,7 +157,6 @@ def main(input_file, outdir="."):
                 "score": f"ERROR: {e}"
             })
 
-    # 将结果写入汇总 txt 文件
     output_file = f"{outdir}/results.txt" if outdir != "." else "results.txt"
     import os
     os.makedirs(outdir, exist_ok=True)
